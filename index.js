@@ -55,14 +55,17 @@ class ServerCloner {
         const sourceGuild = this.client.guilds.cache.get(sourceGuildId);
         const targetGuild = this.client.guilds.cache.get(targetGuildId);
 
-        this.sendProgress(`Cloning from: ${sourceGuild.name} → ${targetGuild.name}`, progressChannel);
+        if (!sourceGuild) throw new Error('Source server not found');
+        if (!targetGuild) throw new Error('Target server not found');
+
+        this.sendProgress(`Cloning from: ${sourceGuild.name} -> ${targetGuild.name}`, progressChannel);
 
         await this.deleteExistingContent(targetGuild, progressChannel, cloneRoles);
 
         if (cloneRoles) {
             await this.cloneRoles(sourceGuild, targetGuild, progressChannel);
         } else {
-            this.sendProgress('⏭️ Skipped role cloning & deletion.', progressChannel);
+            this.sendProgress('⏭️ Skipped role cloning.', progressChannel);
         }
 
         await this.cloneCategories(sourceGuild, targetGuild, progressChannel);
@@ -73,15 +76,21 @@ class ServerCloner {
         }
 
         await this.cloneServerInfo(sourceGuild, targetGuild, progressChannel);
+
         this.showStats(progressChannel);
+        this.sendProgress('🎉 Server cloning completed successfully!', progressChannel);
     }
 
     async deleteExistingContent(guild, progressChannel, cloneRoles) {
         this.sendProgress('🗑️ Deleting existing channels...', progressChannel);
 
-        for (const [, channel] of guild.channels.cache.filter(c => c.deletable)) {
-            await channel.delete().catch(() => {});
-            await delay(100);
+        for (const [, channel] of guild.channels.cache.filter(ch => ch.deletable)) {
+            try {
+                await channel.delete();
+                await delay(100);
+            } catch {
+                this.stats.failed++;
+            }
         }
 
         if (!cloneRoles) {
@@ -94,8 +103,12 @@ class ServerCloner {
         for (const [, role] of guild.roles.cache.filter(r =>
             r.name !== '@everyone' && !r.managed && r.editable
         )) {
-            await role.delete().catch(() => {});
-            await delay(100);
+            try {
+                await role.delete();
+                await delay(100);
+            } catch {
+                this.stats.failed++;
+            }
         }
     }
 
@@ -107,64 +120,149 @@ class ServerCloner {
             .sort((a, b) => a.position - b.position);
 
         for (const [, role] of roles) {
-            const newRole = await targetGuild.roles.create({
-                name: role.name,
-                color: role.hexColor,
-                permissions: role.permissions,
-                hoist: role.hoist,
-                mentionable: role.mentionable
-            }).catch(() => null);
+            try {
+                const newRole = await targetGuild.roles.create({
+                    name: role.name,
+                    color: role.hexColor,
+                    permissions: role.permissions,
+                    hoist: role.hoist,
+                    mentionable: role.mentionable,
+                    reason: 'Server cloning'
+                });
 
-            if (newRole) {
                 this.roleMapping.set(role.id, newRole.id);
                 this.stats.rolesCreated++;
+                await delay(200);
+            } catch {
+                this.stats.failed++;
             }
+        }
 
-            await delay(200);
+        await this.fixRolePositions(sourceGuild, targetGuild);
+    }
+
+    async fixRolePositions(sourceGuild, targetGuild) {
+        const sourceRoles = sourceGuild.roles.cache
+            .filter(r => r.name !== '@everyone')
+            .sort((a, b) => b.position - a.position);
+
+        for (const [, role] of sourceRoles) {
+            const targetRole = targetGuild.roles.cache.find(r => r.name === role.name);
+            if (targetRole?.editable) {
+                try {
+                    await targetRole.setPosition(role.position);
+                    await delay(100);
+                } catch {}
+            }
         }
     }
 
     async cloneCategories(sourceGuild, targetGuild, progressChannel) {
-        for (const [, cat] of sourceGuild.channels.cache.filter(c => c.type === 'GUILD_CATEGORY')) {
-            await targetGuild.channels.create(cat.name, { type: 'GUILD_CATEGORY' }).catch(() => {});
-            this.stats.categoriesCreated++;
-            await delay(200);
+        this.sendProgress('📁 Cloning categories...', progressChannel);
+
+        const categories = sourceGuild.channels.cache
+            .filter(c => c.type === 'GUILD_CATEGORY')
+            .sort((a, b) => a.position - b.position);
+
+        for (const [, category] of categories) {
+            try {
+                const overwrites = this.mapPermissionOverwrites(category.permissionOverwrites, targetGuild);
+                await targetGuild.channels.create(category.name, {
+                    type: 'GUILD_CATEGORY',
+                    permissionOverwrites: overwrites,
+                    position: category.position
+                });
+                this.stats.categoriesCreated++;
+                await delay(200);
+            } catch {
+                this.stats.failed++;
+            }
         }
     }
 
     async cloneChannels(sourceGuild, targetGuild, progressChannel) {
-        for (const [, ch] of sourceGuild.channels.cache.filter(c =>
-            c.type === 'GUILD_TEXT' || c.type === 'GUILD_VOICE'
-        )) {
-            await targetGuild.channels.create(ch.name, { type: ch.type }).catch(() => {});
-            this.stats.channelsCreated++;
-            await delay(200);
+        this.sendProgress('💬 Cloning channels...', progressChannel);
+
+        const channels = sourceGuild.channels.cache
+            .filter(c => c.type === 'GUILD_TEXT' || c.type === 'GUILD_VOICE')
+            .sort((a, b) => a.position - b.position);
+
+        for (const [, channel] of channels) {
+            try {
+                const overwrites = this.mapPermissionOverwrites(channel.permissionOverwrites, targetGuild);
+                const parent = channel.parent
+                    ? targetGuild.channels.cache.find(c => c.name === channel.parent.name && c.type === 'GUILD_CATEGORY')
+                    : null;
+
+                const options = {
+                    type: channel.type,
+                    parent: parent?.id,
+                    permissionOverwrites: overwrites,
+                    position: channel.position
+                };
+
+                if (channel.type === 'GUILD_TEXT') {
+                    options.topic = channel.topic;
+                    options.nsfw = channel.nsfw;
+                    options.rateLimitPerUser = channel.rateLimitPerUser;
+                } else {
+                    options.bitrate = channel.bitrate;
+                    options.userLimit = channel.userLimit;
+                }
+
+                await targetGuild.channels.create(channel.name, options);
+                this.stats.channelsCreated++;
+                await delay(200);
+            } catch {
+                this.stats.failed++;
+            }
         }
     }
 
     async cloneEmojis(sourceGuild, targetGuild, progressChannel) {
+        this.sendProgress('😀 Cloning emojis...', progressChannel);
+
         for (const [, emoji] of sourceGuild.emojis.cache) {
-            const img = await downloadImage(emoji.url).catch(() => null);
-            if (img) {
-                await targetGuild.emojis.create(img, emoji.name).catch(() => {});
+            try {
+                const img = await downloadImage(emoji.url);
+                await targetGuild.emojis.create(img, emoji.name);
                 this.stats.emojisCreated++;
+                await delay(2000);
+            } catch {
+                this.stats.failed++;
             }
-            await delay(2000);
         }
     }
 
     async cloneServerInfo(sourceGuild, targetGuild) {
-        await targetGuild.setName(sourceGuild.name).catch(() => {});
+        await targetGuild.setName(sourceGuild.name);
+        if (sourceGuild.iconURL()) {
+            const icon = await downloadImage(sourceGuild.iconURL({ format: 'png', size: 1024 }));
+            await targetGuild.setIcon(icon);
+        }
+    }
+
+    mapPermissionOverwrites(overwrites, targetGuild) {
+        const mapped = [];
+        if (!overwrites?.cache) return mapped;
+
+        overwrites.cache.forEach(o => {
+            const id = this.roleMapping.get(o.id) || o.id;
+            mapped.push({ id, type: o.type, allow: o.allow, deny: o.deny });
+        });
+
+        return mapped;
     }
 
     showStats(ch) {
         if (!ch) return;
         ch.send(
-`📊 Stats
+`📊 Cloning Statistics
 Roles: ${this.stats.rolesCreated}
 Categories: ${this.stats.categoriesCreated}
 Channels: ${this.stats.channelsCreated}
-Emojis: ${this.stats.emojisCreated}`
+Emojis: ${this.stats.emojisCreated}
+Failed: ${this.stats.failed}`
         ).catch(() => {});
     }
 
