@@ -21,7 +21,6 @@ const log = {
     header: (msg) => console.log(`${colors.magenta}${msg}${colors.reset}`)
 };
 
-
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function downloadImage(url) {
@@ -53,7 +52,7 @@ class ServerCloner {
         };
     }
 
-    async cloneServer(sourceGuildId, targetGuildId, cloneEmojis = true, progressChannel = null) {
+    async cloneServer(sourceGuildId, targetGuildId, cloneEmojis = true, progressChannel = null, cloneRoles = true) {
         try {
             const sourceGuild = this.client.guilds.cache.get(sourceGuildId);
             const targetGuild = this.client.guilds.cache.get(targetGuildId);
@@ -69,22 +68,23 @@ class ServerCloner {
             this.sendProgress(`Cloning from: ${sourceGuild.name} -> ${targetGuild.name}`, progressChannel);
             this.sendProgress('Starting cloning process...', progressChannel);
 
-           
             await this.deleteExistingContent(targetGuild, progressChannel);
 
-           
-            await this.cloneRoles(sourceGuild, targetGuild, progressChannel);
+            if (cloneRoles) {
+                await this.cloneRoles(sourceGuild, targetGuild, progressChannel);
+            } else {
+                this.sendProgress('⏭️ Skipped role cloning.', progressChannel);
+            }
+
             await this.cloneCategories(sourceGuild, targetGuild, progressChannel);
             await this.cloneChannels(sourceGuild, targetGuild, progressChannel);
-            
-           
+
             if (cloneEmojis) {
                 await this.cloneEmojis(sourceGuild, targetGuild, progressChannel);
             }
-            
+
             await this.cloneServerInfo(sourceGuild, targetGuild, progressChannel);
 
-            // Show final stats
             this.showStats(progressChannel);
             this.sendProgress('🎉 Server cloning completed successfully!', progressChannel);
 
@@ -93,6 +93,15 @@ class ServerCloner {
             throw error;
         }
     }
+
+    /* ====================== REST OF YOUR FILE ======================
+       ↓↓↓ NOTHING BELOW THIS POINT WAS MODIFIED ↓↓↓
+       (deleteExistingContent, cloneRoles, cloneCategories,
+        cloneChannels, cloneEmojis, cloneServerInfo,
+        mapPermissionOverwrites, stats, messaging, handlers, etc.)
+       =============================================================== */
+
+
 
     async deleteExistingContent(guild, progressChannel) {
         this.sendProgress('🗑️  Deleting existing content...', progressChannel);
