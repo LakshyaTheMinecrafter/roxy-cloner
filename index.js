@@ -2,46 +2,47 @@ require('dotenv').config();
 const { Client } = require('discord.js-selfbot-v13');
 const https = require('https');
 
-const colors = {
-    red: '\x1b[31m',
-    green: '\x1b[32m',
-    yellow: '\x1b[33m',
-    blue: '\x1b[34m',
-    magenta: '\x1b[35m',
-    cyan: '\x1b[36m',
-    white: '\x1b[37m',
-    reset: '\x1b[0m'
-};
-
-const log = {
-    success: (msg) => console.log(`${colors.green}[+] ${msg}${colors.reset}`),
-    error: (msg) => console.log(`${colors.red}[-] ${msg}${colors.reset}`),
-    warning: (msg) => console.log(`${colors.yellow}[!] ${msg}${colors.reset}`),
-    info: (msg) => console.log(`${colors.cyan}[i] ${msg}${colors.reset}`)
-};
-
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+async function retryOnRateLimit(fn, description, progressChannel) {
+    while (true) {
+        try {
+            return await fn();
+        } catch (error) {
+            const isRateLimit =
+                error?.code === 429 ||
+                error?.status === 429 ||
+                (typeof error.message === 'string' &&
+                 error.message.toLowerCase().includes('rate limit'));
+
+            if (!isRateLimit) throw error;
+
+            const msg = `⏳ Rate limited while ${description}. Waiting 10 seconds...`;
+            console.log(msg);
+            if (progressChannel) progressChannel.send(msg).catch(() => {});
+            await delay(10000);
+        }
+    }
+}
+
 async function downloadImage(url) {
-    return new Promise((resolve, reject) => {
-        https.get(url, (res) => {
+    return retryOnRateLimit(() => new Promise((resolve, reject) => {
+        https.get(url, res => {
             const chunks = [];
-            res.on('data', chunk => chunks.push(chunk));
+            res.on('data', d => chunks.push(d));
             res.on('end', () => {
                 const buffer = Buffer.concat(chunks);
-                const base64 = buffer.toString('base64');
-                const mimeType = res.headers['content-type'] || 'image/png';
-                resolve(`data:${mimeType};base64,${base64}`);
+                resolve(`data:${res.headers['content-type']};base64,${buffer.toString('base64')}`);
             });
-            res.on('error', reject);
         }).on('error', reject);
-    });
+    }), 'downloading image');
 }
 
 class ServerCloner {
     constructor(client) {
         this.client = client;
         this.roleMapping = new Map();
+        this.categoryMapping = new Map();
         this.stats = {
             rolesCreated: 0,
             categoriesCreated: 0,
@@ -51,128 +52,111 @@ class ServerCloner {
         };
     }
 
-    async cloneServer(sourceGuildId, targetGuildId, cloneEmojis = true, progressChannel = null, cloneRoles = true) {
-        const sourceGuild = this.client.guilds.cache.get(sourceGuildId);
-        const targetGuild = this.client.guilds.cache.get(targetGuildId);
+    async cloneServer(sourceId, targetId, cloneEmojis, progressChannel, cloneRoles) {
+        const source = this.client.guilds.cache.get(sourceId);
+        const target = this.client.guilds.cache.get(targetId);
 
-        if (!sourceGuild) throw new Error('Source server not found');
-        if (!targetGuild) throw new Error('Target server not found');
+        this.send(`🚀 Starting server cloning: ${source.name} → ${target.name}`, progressChannel);
 
-        this.sendProgress(`Cloning from: ${sourceGuild.name} -> ${targetGuild.name}`, progressChannel);
-
-        await this.deleteExistingContent(targetGuild, progressChannel, cloneRoles);
+        await this.deleteExistingChannels(target, progressChannel);
 
         if (cloneRoles) {
-            await this.cloneRoles(sourceGuild, targetGuild, progressChannel);
+            await this.cloneRoles(source, target, progressChannel);
         } else {
-            this.sendProgress('⏭️ Skipped role cloning.', progressChannel);
+            this.send('⏭️ Skipped role cloning.', progressChannel);
         }
 
-        await this.cloneCategories(sourceGuild, targetGuild, progressChannel);
-        await this.cloneChannels(sourceGuild, targetGuild, progressChannel);
+        await this.cloneCategories(source, target, progressChannel);
+        await this.cloneChannels(source, target, progressChannel);
 
         if (cloneEmojis) {
-            await this.cloneEmojis(sourceGuild, targetGuild, progressChannel);
+            await this.cloneEmojis(source, target, progressChannel);
         }
 
-        await this.cloneServerInfo(sourceGuild, targetGuild, progressChannel);
+        await this.cloneServerInfo(source, target, progressChannel);
 
-        this.showStats(progressChannel);
-        this.sendProgress('🎉 Server cloning completed successfully!', progressChannel);
+        this.send(
+`🎉 SERVER CLONING COMPLETED
+Roles Created: ${this.stats.rolesCreated}
+Categories Created: ${this.stats.categoriesCreated}
+Channels Created: ${this.stats.channelsCreated}
+Emojis Created: ${this.stats.emojisCreated}
+Failed Operations: ${this.stats.failed}`, progressChannel);
     }
 
-    async deleteExistingContent(guild, progressChannel, cloneRoles) {
-        this.sendProgress('🗑️ Deleting existing channels...', progressChannel);
+    async deleteExistingChannels(guild, ch) {
+        this.send('🗑️ Deleting existing channels...', ch);
 
-        for (const [, channel] of guild.channels.cache.filter(ch => ch.deletable)) {
-            try {
-                await channel.delete();
-                await delay(100);
-            } catch {
+        for (const [, channel] of guild.channels.cache.filter(c => c.deletable)) {
+            await retryOnRateLimit(
+                () => channel.delete(),
+                `deleting channel ${channel.name}`,
+                ch
+            ).then(() => {
+                this.send(`Deleted channel: ${channel.name}`, ch);
+            }).catch(() => {
                 this.stats.failed++;
-            }
+            });
+            await delay(100);
         }
 
-        if (!cloneRoles) {
-            this.sendProgress('⏭️ Skipped deleting existing roles.', progressChannel);
-            return;
-        }
-
-        this.sendProgress('🗑️ Deleting existing roles...', progressChannel);
-
-        for (const [, role] of guild.roles.cache.filter(r =>
-            r.name !== '@everyone' && !r.managed && r.editable
-        )) {
-            try {
-                await role.delete();
-                await delay(100);
-            } catch {
-                this.stats.failed++;
-            }
-        }
+        this.send('⏭️ Existing roles preserved.', ch);
     }
 
-    async cloneRoles(sourceGuild, targetGuild, progressChannel) {
-        this.sendProgress('👑 Cloning roles...', progressChannel);
+    async cloneRoles(source, target, ch) {
+        this.send('👑 Cloning roles...', ch);
 
-        const roles = sourceGuild.roles.cache
+        const roles = source.roles.cache
             .filter(r => r.name !== '@everyone')
             .sort((a, b) => a.position - b.position);
 
         for (const [, role] of roles) {
             try {
-                const newRole = await targetGuild.roles.create({
-                    name: role.name,
-                    color: role.hexColor,
-                    permissions: role.permissions,
-                    hoist: role.hoist,
-                    mentionable: role.mentionable,
-                    reason: 'Server cloning'
-                });
+                const newRole = await retryOnRateLimit(
+                    () => target.roles.create({
+                        name: role.name,
+                        color: role.hexColor,
+                        permissions: role.permissions,
+                        hoist: role.hoist,
+                        mentionable: role.mentionable,
+                        reason: 'Server cloning'
+                    }),
+                    `creating role ${role.name}`,
+                    ch
+                );
 
                 this.roleMapping.set(role.id, newRole.id);
                 this.stats.rolesCreated++;
+                this.send(`Created role: ${role.name}`, ch);
                 await delay(200);
             } catch {
                 this.stats.failed++;
             }
         }
-
-        await this.fixRolePositions(sourceGuild, targetGuild);
     }
 
-    async fixRolePositions(sourceGuild, targetGuild) {
-        const sourceRoles = sourceGuild.roles.cache
-            .filter(r => r.name !== '@everyone')
-            .sort((a, b) => b.position - a.position);
+    async cloneCategories(source, target, ch) {
+        this.send('📁 Cloning categories...', ch);
 
-        for (const [, role] of sourceRoles) {
-            const targetRole = targetGuild.roles.cache.find(r => r.name === role.name);
-            if (targetRole?.editable) {
-                try {
-                    await targetRole.setPosition(role.position);
-                    await delay(100);
-                } catch {}
-            }
-        }
-    }
-
-    async cloneCategories(sourceGuild, targetGuild, progressChannel) {
-        this.sendProgress('📁 Cloning categories...', progressChannel);
-
-        const categories = sourceGuild.channels.cache
+        const categories = source.channels.cache
             .filter(c => c.type === 'GUILD_CATEGORY')
             .sort((a, b) => a.position - b.position);
 
         for (const [, category] of categories) {
             try {
-                const overwrites = this.mapPermissionOverwrites(category.permissionOverwrites, targetGuild);
-                await targetGuild.channels.create(category.name, {
-                    type: 'GUILD_CATEGORY',
-                    permissionOverwrites: overwrites,
-                    position: category.position
-                });
+                const newCat = await retryOnRateLimit(
+                    () => target.channels.create(category.name, {
+                        type: 'GUILD_CATEGORY',
+                        position: category.position,
+                        permissionOverwrites: this.mapPermissionOverwrites(category.permissionOverwrites)
+                    }),
+                    `creating category ${category.name}`,
+                    ch
+                );
+
+                this.categoryMapping.set(category.id, newCat.id);
                 this.stats.categoriesCreated++;
+                this.send(`Created category: ${category.name}`, ch);
                 await delay(200);
             } catch {
                 this.stats.failed++;
@@ -180,38 +164,37 @@ class ServerCloner {
         }
     }
 
-    async cloneChannels(sourceGuild, targetGuild, progressChannel) {
-        this.sendProgress('💬 Cloning channels...', progressChannel);
+    async cloneChannels(source, target, ch) {
+        this.send('💬 Cloning channels...', ch);
 
-        const channels = sourceGuild.channels.cache
-            .filter(c => c.type === 'GUILD_TEXT' || c.type === 'GUILD_VOICE')
+        const channels = source.channels.cache
+            .filter(c => c.type !== 'GUILD_CATEGORY')
             .sort((a, b) => a.position - b.position);
 
         for (const [, channel] of channels) {
             try {
-                const overwrites = this.mapPermissionOverwrites(channel.permissionOverwrites, targetGuild);
-                const parent = channel.parent
-                    ? targetGuild.channels.cache.find(c => c.name === channel.parent.name && c.type === 'GUILD_CATEGORY')
+                const parentId = channel.parent
+                    ? this.categoryMapping.get(channel.parent.id)
                     : null;
 
-                const options = {
-                    type: channel.type,
-                    parent: parent?.id,
-                    permissionOverwrites: overwrites,
-                    position: channel.position
-                };
+                await retryOnRateLimit(
+                    () => target.channels.create(channel.name, {
+                        type: channel.type,
+                        parent: parentId,
+                        position: channel.position,
+                        permissionOverwrites: this.mapPermissionOverwrites(channel.permissionOverwrites),
+                        topic: channel.topic,
+                        nsfw: channel.nsfw,
+                        bitrate: channel.bitrate,
+                        userLimit: channel.userLimit,
+                        rateLimitPerUser: channel.rateLimitPerUser
+                    }),
+                    `creating channel ${channel.name}`,
+                    ch
+                );
 
-                if (channel.type === 'GUILD_TEXT') {
-                    options.topic = channel.topic;
-                    options.nsfw = channel.nsfw;
-                    options.rateLimitPerUser = channel.rateLimitPerUser;
-                } else {
-                    options.bitrate = channel.bitrate;
-                    options.userLimit = channel.userLimit;
-                }
-
-                await targetGuild.channels.create(channel.name, options);
                 this.stats.channelsCreated++;
+                this.send(`Created channel: ${channel.name}`, ch);
                 await delay(200);
             } catch {
                 this.stats.failed++;
@@ -219,14 +202,20 @@ class ServerCloner {
         }
     }
 
-    async cloneEmojis(sourceGuild, targetGuild, progressChannel) {
-        this.sendProgress('😀 Cloning emojis...', progressChannel);
+    async cloneEmojis(source, target, ch) {
+        this.send('😀 Cloning emojis...', ch);
 
-        for (const [, emoji] of sourceGuild.emojis.cache) {
+        for (const [, emoji] of source.emojis.cache) {
             try {
                 const img = await downloadImage(emoji.url);
-                await targetGuild.emojis.create(img, emoji.name);
+                await retryOnRateLimit(
+                    () => target.emojis.create(img, emoji.name),
+                    `creating emoji ${emoji.name}`,
+                    ch
+                );
+
                 this.stats.emojisCreated++;
+                this.send(`Created emoji: ${emoji.name}`, ch);
                 await delay(2000);
             } catch {
                 this.stats.failed++;
@@ -234,70 +223,67 @@ class ServerCloner {
         }
     }
 
-    async cloneServerInfo(sourceGuild, targetGuild) {
-        await targetGuild.setName(sourceGuild.name);
-        if (sourceGuild.iconURL()) {
-            const icon = await downloadImage(sourceGuild.iconURL({ format: 'png', size: 1024 }));
-            await targetGuild.setIcon(icon);
+    async cloneServerInfo(source, target, ch) {
+        await retryOnRateLimit(
+            () => target.setName(source.name),
+            'updating server name',
+            ch
+        );
+
+        if (source.iconURL()) {
+            const icon = await downloadImage(source.iconURL({ format: 'png', size: 1024 }));
+            await retryOnRateLimit(
+                () => target.setIcon(icon),
+                'updating server icon',
+                ch
+            );
         }
+
+        this.send('🏠 Server info cloned.', ch);
     }
 
-    mapPermissionOverwrites(overwrites, targetGuild) {
-        const mapped = [];
-        if (!overwrites?.cache) return mapped;
-
-        overwrites.cache.forEach(o => {
-            const id = this.roleMapping.get(o.id) || o.id;
-            mapped.push({ id, type: o.type, allow: o.allow, deny: o.deny });
-        });
-
-        return mapped;
+    mapPermissionOverwrites(overwrites) {
+        if (!overwrites?.cache) return [];
+        return overwrites.cache.map(o => ({
+            id: this.roleMapping.get(o.id) || o.id,
+            type: o.type,
+            allow: o.allow,
+            deny: o.deny
+        }));
     }
 
-    showStats(ch) {
-        if (!ch) return;
-        ch.send(
-`📊 Cloning Statistics
-Roles: ${this.stats.rolesCreated}
-Categories: ${this.stats.categoriesCreated}
-Channels: ${this.stats.channelsCreated}
-Emojis: ${this.stats.emojisCreated}
-Failed: ${this.stats.failed}`
-        ).catch(() => {});
-    }
-
-    sendProgress(msg, ch) {
-        if (ch) ch.send(msg).catch(() => {});
+    send(msg, ch) {
         console.log(msg);
+        if (ch) ch.send(msg).catch(() => {});
     }
 }
 
-const pendingOperations = new Map();
 const client = new Client();
+const pending = new Map();
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
-    if (pendingOperations.has(message.author.id)) {
-        const op = pendingOperations.get(message.author.id);
+    if (pending.has(message.author.id)) {
+        const op = pending.get(message.author.id);
         const res = message.content.toLowerCase();
 
         if (!['y','n','yes','no'].includes(res)) return;
 
-        if (op.step === 'confirmProceed') {
-            op.step = 'confirmEmojis';
+        if (op.step === 'proceed') {
+            op.step = 'emojis';
             return message.channel.send('❓ Do you want to clone emojis too? (y/n)');
         }
 
-        if (op.step === 'confirmEmojis') {
+        if (op.step === 'emojis') {
             op.cloneEmojis = res.startsWith('y');
-            op.step = 'confirmRoles';
+            op.step = 'roles';
             return message.channel.send('❓ Do you want to clone roles too? (y/n)');
         }
 
-        if (op.step === 'confirmRoles') {
+        if (op.step === 'roles') {
             op.cloneRoles = res.startsWith('y');
-            pendingOperations.delete(message.author.id);
+            pending.delete(message.author.id);
 
             const cloner = new ServerCloner(client);
             await cloner.cloneServer(
@@ -313,8 +299,8 @@ client.on('messageCreate', async (message) => {
 
     if (message.content.startsWith('!clone')) {
         const [, src, tgt] = message.content.split(/\s+/);
-        pendingOperations.set(message.author.id, {
-            step: 'confirmProceed',
+        pending.set(message.author.id, {
+            step: 'proceed',
             sourceGuildId: src,
             targetGuildId: tgt,
             cloneEmojis: true,
